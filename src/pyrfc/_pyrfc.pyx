@@ -387,6 +387,64 @@ cdef class Connection:
         finally:
             RfcDestroyFunction(funcCont, NULL)
 
+    def call_and_save_table(self, func_name, table_name, fnOnStartTable, fnOnEndTable, fnOnGetTableRow, **params):
+        """ Invokes a remote-enabled function module via RFC.
+
+        :param func_name (str): Name of the function module that will be invoked.
+        :param table_name (str): Name of the table to save
+        :param fnOnStartTable (func): Callback for starting the table
+        :param fnOnEndTable (func): Callback for starting the table
+        :param fnOnGetTableRow (func): Callback for starting the table
+        :param params (kwargs): Parameter of the function module. All non optional
+              IMPORT, CHANGING, and TABLE parameters must be provided.
+
+        :return: Boolean
+
+        :raises: :exc:`~pyrfc.RFCError` or a subclass
+                 thereof if the RFC call fails.
+        """
+        cdef RFC_RC rc
+        cdef RFC_ERROR_INFO errorInfo
+        cdef unsigned paramCount
+
+        cdef RFC_TABLE_HANDLE table_handle
+        cdef RFC_TYPE_DESC_HANDLE table_type_desc
+        cdef RFC_PARAMETER_DESC paramDesc
+
+        funcName = fillString(func_name)
+        if not self.alive:
+            self._open()
+        cdef RFC_FUNCTION_DESC_HANDLE funcDesc = RfcGetFunctionDesc(self._handle, funcName, &errorInfo)
+        free(funcName)
+        if not funcDesc:
+            self._error(&errorInfo)
+        cdef RFC_FUNCTION_HANDLE funcCont = RfcCreateFunction(funcDesc, &errorInfo)
+        if not funcCont:
+            self._error(&errorInfo)
+        try: # now we have a function module
+            for name, value in params.iteritems():
+                fillFunctionParameter(funcDesc, funcCont, name, value)
+            with nogil:
+                rc = RfcInvoke(self._handle, funcCont, &errorInfo)
+            if rc != RFC_OK:
+                self._error(&errorInfo)
+
+            tableName = fillString(table_name)
+            try:
+                rc = RfcGetParameterDescByName(funcDesc, tableName, &paramDesc, &errorInfo)
+                if rc != RFC_OK:
+                    self._error(&errorInfo)
+                table_type_desc = paramDesc.typeDescHandle
+                rc = RfcGetTable(funcCont, tableName, &table_handle, &errorInfo)
+                if rc != RFC_OK:
+                    self._error(&errorInfo)
+                writeTable(table_type_desc, table_handle, self._bconfig, fnOnStartTable, fnOnEndTable, fnOnGetTableRow)
+                return True
+            finally:
+                free(tableName)
+        finally:
+            RfcDestroyFunction(funcCont, NULL)
+
     ##########################################################################
     ## HELPER METHODS
     def type_desc_get(self, type_name):
@@ -1978,6 +2036,69 @@ cdef wrapTable(RFC_TYPE_DESC_HANDLE typeDesc, RFC_TABLE_HANDLE container, config
         RfcMoveTo(container, i, &errorInfo)
         result.append(wrapStructure(typeDesc, container, config))
     return result
+
+cdef writeTable(RFC_TYPE_DESC_HANDLE typeDesc, RFC_TABLE_HANDLE table_handle, config, fnOnStartTable, fnOnEndTable, fnOnGetTableRow):
+    cdef RFC_RC rc
+    cdef RFC_ERROR_INFO errorInfo
+    cdef unsigned i, fieldCount, rowCount
+    # # For debugging in tables (cf. class TableCursor)
+    # tc = TableCursor()
+    # tc.typeDesc = typeDesc
+    # tc.container = table_handle
+    # return tc
+
+    ## get the field names array and sort it, this can be passed to a DictWriter so the field order is predictable
+    header_dict = {}
+    headers_array = []
+    cdef RFC_FIELD_DESC fieldDesc
+    rc = RfcGetFieldCount(typeDesc, &fieldCount, &errorInfo)
+    if rc != RFC_OK:
+        raise wrapError(&errorInfo)
+
+    for i in range(fieldCount):
+        rc = RfcGetFieldDescByIndex(typeDesc, i, &fieldDesc, &errorInfo)
+        if rc != RFC_OK:
+            raise wrapError(&errorInfo)
+        header_dict[wrapString(fieldDesc.name)] = wrapString(fieldDesc.name)
+
+    headers_array = sorted(header_dict.keys())
+
+    rc = RfcGetRowCount(table_handle, &rowCount, &errorInfo)
+    if rc != RFC_OK:
+        raise wrapError(&errorInfo)
+
+    fnOnStartTable(headers_array, rowCount)
+
+    #batch = []
+    for i in xrange(rowCount):
+        rc = RfcMoveTo(table_handle, i, &errorInfo)
+        if rc != RFC_OK:
+            raise wrapError(&errorInfo)
+        fnOnGetTableRow(wrapStructure(typeDesc, table_handle, config))
+        #batch.append(wrapTableRow(typeDesc, table_handle, config, field_desc_array))
+        #if ((i+1) % batch_size == 0) or (i == rowCount-1):
+        #    fnOnGetTableRow(batch)
+        #    batch = []
+
+    fnOnEndTable()
+
+    return []
+
+#cdef wrapTableRow(RFC_TYPE_DESC_HANDLE typeDesc, RFC_STRUCTURE_HANDLE container, config, field_desc_array):
+    #cdef RFC_RC rc
+    #cdef RFC_ERROR_INFO errorInfo
+    #cdef unsigned i, fieldCount
+    #cdef RFC_FIELD_DESC fieldDesc
+    ##RfcGetFieldCount(typeDesc, &fieldCount, NULL)
+    #result = {}
+    #for i, fd in field_desc_array:
+        ##RfcGetFieldDescByIndex(typeDesc, i, &fieldDesc, NULL)
+        #fieldDesc = fd
+        #result[wrapString(fieldDesc.name)] = wrapVariable(fieldDesc.type, container, fieldDesc.name, fieldDesc.nucLength, fieldDesc.typeDescHandle, config)
+    #if len(result) == 1:
+        #if '' in result:
+            #result = result['']
+    #return result
 
 cdef wrapVariable(RFCTYPE typ, RFC_FUNCTION_HANDLE container, SAP_UC* cName, unsigned cLen, RFC_TYPE_DESC_HANDLE typeDesc, config):
     cdef RFC_RC rc
